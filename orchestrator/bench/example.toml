@@ -1,0 +1,62 @@
+experiment = "first-try"
+results_dir = "results"
+netbench = "./netbench"       # static build: CGO_ENABLED=0 go build -o netbench .
+
+runtime = "netns"             # netns (dev/test of the host plumbing) | docker
+docker_runtime = ""           # "runsc" for gVisor, "" for the default runtime
+docker_image = "busybox:latest"
+
+setups = ["0", "1"]
+ns = [1, 5, 10, 20, 50]
+runs = 3
+max_retries = 2               # re-runs of a run whose clients reported valid=false
+lead_base_s = 3.0             # start lead = this + N * (cost of launching one client)
+seed = 1
+
+[cores]                       # 6-core layout; adjust to the machine (SMT siblings off)
+os = "0"                      # OS, Docker, orchestrator, host-side helper server
+sandbox = "1-2"               # sandboxes and their clients
+mediator = "3-4"              # Envoy / router (unused by setups 0 and 1)
+target = "5"                  # target server
+
+[[benchmark]]
+name = "ttfb"
+cmd = "ttfb"
+args = ["--rate", "100", "--size", "64"]
+warmup = 5
+duration = 20
+
+[[benchmark]]
+name = "latency"
+cmd = "latency"
+args = ["--rate", "200", "--conns", "1", "--size", "64"]
+warmup = 5
+duration = 20
+
+[[benchmark]]
+name = "tput_up_1"
+cmd = "tput"
+args = ["--dir", "up", "--streams", "1"]
+warmup = 3
+duration = 15
+
+[[benchmark]]
+name = "tput_down_1"
+cmd = "tput"
+args = ["--dir", "down", "--streams", "1"]
+warmup = 3
+duration = 15
+
+[[benchmark]]
+name = "tput_up_8"
+cmd = "tput"
+args = ["--dir", "up", "--streams", "8"]
+warmup = 3
+duration = 15
+
+[[benchmark]]
+name = "tput_down_8"
+cmd = "tput"
+args = ["--dir", "down", "--streams", "8"]
+warmup = 3
+duration = 15
