@@ -43,14 +43,38 @@ class Config:
     runs: int
     max_retries: int
     lead_base_s: float
+    launch_cost_s: float | None   # seconds to start one client in a sandbox; None = runtime default
+    envoy: str                    # envoy binary (path or name on PATH), used by setups 2 and 3
+    envoy_admin_port: int
+    router: str                   # command that starts the router on the host (setup 4), e.g. "/opt/router/Router"
+    router_url: str               # where the router's REST API listens
+    sidecar: str                  # sidecar executable on the host; it is mounted into every sandbox (setup 4)
     seed: int
     benchmarks: list[Bench]
     raw: dict
 
 
+RUNTIME_ALIASES = {            # what people naturally write -> (runtime, docker_runtime)
+    "runsc": ("docker", "runsc"), "gvisor": ("docker", "runsc"), "runc": ("docker", ""),
+}
+
+
+def normalize_runtime(raw: dict) -> None:
+    """runtime is netns or docker; gVisor is docker with docker_runtime = "runsc".
+    Aliases are accepted and written back, so the manifest always records the explicit form."""
+    rt = raw.get("runtime", "netns")
+    if rt in RUNTIME_ALIASES:
+        raw["runtime"], raw["docker_runtime"] = RUNTIME_ALIASES[rt]
+    elif rt not in ("netns", "docker"):
+        raise ValueError(f'runtime = "{rt}" is not valid. Use runtime = "docker" (with docker_runtime = "runsc" for gVisor, '
+                         f'or "" for runc), or runtime = "netns". Shortcuts also accepted: runsc, gvisor, runc.')
+    raw.setdefault("runtime", "netns")
+
+
 def load(path: str | Path) -> Config:
     p = Path(path)
     raw = tomllib.loads(p.read_text())
+    normalize_runtime(raw)
     base = p.parent
     benches = [
         Bench(b["name"], b["cmd"], [str(x) for x in b.get("args", [])], float(b["warmup"]), float(b["duration"]))
@@ -69,6 +93,12 @@ def load(path: str | Path) -> Config:
         runs=int(raw.get("runs", 3)),
         max_retries=int(raw.get("max_retries", 2)),
         lead_base_s=float(raw.get("lead_base_s", 3.0)),
+        launch_cost_s=(float(raw["launch_cost_s"]) if "launch_cost_s" in raw else None),
+        envoy=raw.get("envoy", "envoy"),
+        envoy_admin_port=int(raw.get("envoy_admin_port", 9901)),
+        router=raw.get("router", ""),
+        router_url=raw.get("router_url", "http://127.0.0.1:5010"),
+        sidecar=raw.get("sidecar", ""),
         seed=int(raw.get("seed", 1)),
         benchmarks=benches,
         raw=raw,

@@ -61,6 +61,21 @@ fi
 # 4. boost off (the file only exists with some drivers)
 if [[ -e $SYS/cpufreq/boost ]]; then write 0 "$SYS/cpufreq/boost"; fi
 
+# 5. connection tracking. The TTFB benchmark creates one tracked flow per connection (125k+ per run at N=50);
+#    a full table silently drops new connections, which shows up as timeouts. CT_MAX=0 skips this step.
+CT_MAX="${CT_MAX:-2097152}"
+CT=/proc/sys/net/netfilter/nf_conntrack_max
+HS=/sys/module/nf_conntrack/parameters/hashsize
+if (( CT_MAX > 0 )); then
+  [[ -e $CT ]] || modprobe nf_conntrack 2>/dev/null
+  if [[ -e $CT ]]; then
+    (( $(<"$CT") < CT_MAX )) && write "$CT_MAX" "$CT"
+    [[ -w $HS ]] && (( $(<"$HS") < CT_MAX / 4 )) && write "$((CT_MAX / 4))" "$HS"
+  else
+    echo "note: nf_conntrack is not loaded, nothing to raise"
+  fi
+fi
+
 # ---- report ----
 echo
 echo "== state =="
@@ -75,6 +90,7 @@ for c in "${CPUS[@]}"; do
     "$(cat "$p/scaling_min_freq" 2>/dev/null || echo n/a)" \
     "$(cat "$p/scaling_max_freq" 2>/dev/null || echo n/a)"
 done
+echo "conntrack:   max=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo n/a) buckets=$(cat "$HS" 2>/dev/null || echo n/a)"
 for c in "${CPUS[@]}"; do
   line=""
   for s in "$SYS/cpu$c"/cpuidle/state*; do
@@ -111,3 +127,4 @@ if (( warn )); then
   exit 1
 fi
 echo "Host tuned. Settings last until reboot."
+

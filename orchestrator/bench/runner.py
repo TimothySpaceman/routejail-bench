@@ -15,8 +15,9 @@ import subprocess
 from . import manifest
 from .config import Bench, Config, parse_cpus
 from .runtime import Runtime, Sandbox, make_runtime
+from .procs import ProcSampler
 from .sampler import CoreSampler
-from .setups import Setup, make_setup
+from .setups import Setup, kill_leftovers, make_setup
 from .sh import log, run
 from .topology import Topology
 
@@ -46,24 +47,26 @@ def _jsonline(text: str) -> dict | None:
 
 
 class Runner:
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, runtime: Runtime | None = None, topo=None):
         self.cfg = cfg
-        self.rt: Runtime = make_runtime(cfg)
-        self.topo = Topology(cfg)
+        self.rt: Runtime = runtime or make_runtime(cfg)     # injectable, so the logic can be tested without a host
+        self.topo = topo or Topology(cfg)
         self.out = cfg.results_dir / cfg.experiment
         self.lead_extra = 0.0
 
     # ---------- plan ----------
 
-    def run_all(self):
+    def run_all(self, force: bool = False):
         cpus = parse_cpus(self.cfg.cores["os"])
         os.sched_setaffinity(0, set(cpus))          # the orchestrator stays on the OS cores
         self.out.mkdir(parents=True, exist_ok=True)
-        manifest.write(self.out / "manifest.json", manifest.collect(self.cfg, self.rt))
+        self._check_resume(force)
         plan = [(s, n) for s in self.cfg.setups for n in self.cfg.ns]
         random.Random(self.cfg.seed).shuffle(plan)
         log.info("plan: %s", plan)
-        for setup_id, n in plan:
+        t_start = time.time()
+        for i, (setup_id, n) in enumerate(plan, 1):
+            log.info("--- group %d of %d (elapsed %.0f min) ---", i, len(plan), (time.time() - t_start) / 60)
             if self._group_done(setup_id, n):
                 log.info("skip setup %s n=%d (already done)", setup_id, n)
                 continue
@@ -74,6 +77,23 @@ class Runner:
                 gdir = self._group_dir(setup_id, n)
                 gdir.mkdir(parents=True, exist_ok=True)
                 (gdir / "failed.json").write_text(json.dumps({"error": traceback.format_exc()}, indent=2))
+
+    def _check_resume(self, force: bool):
+        """The first session writes manifest.json; later sessions (resume) are compared against it, so results
+        from different runtimes, tuning or benchmark definitions never end up mixed in one experiment."""
+        new = manifest.collect(self.cfg, self.rt)
+        path = self.out / "manifest.json"
+        if not path.exists():
+            manifest.write(path, new)
+            return
+        diffs = manifest.compare(json.loads(path.read_text()), new)
+        if diffs and not force:
+            raise SystemExit("This experiment was started with a different configuration or host state:\n  "
+                             + "\n  ".join(diffs)
+                             + "\nUse a new `experiment` name, or --force to continue anyway (results will be mixed).")
+        if diffs:
+            log.warning("continuing despite differences from the first session:\n  %s", "\n  ".join(diffs))
+        manifest.write(self.out / f"manifest.session-{int(time.time())}.json", new)
 
     def _group_dir(self, setup_id: str, n: int) -> Path:
         from .setups import SETUPS
@@ -91,7 +111,9 @@ class Runner:
     def run_group(self, setup_id: str, n: int):
         log.info("=== setup %s, n=%d ===", setup_id, n)
         self.rt.cleanup_all()
+        kill_leftovers(self.cfg)
         setup = make_setup(setup_id, self.cfg, self.rt)
+        setup.workdir = self._group_dir(setup_id, n) / "mediator"
         self.topo.up()
         try:
             self.topo.start_servers()
@@ -144,20 +166,32 @@ class Runner:
         final = cell / f"run{r}"
         if final.exists():
             return
-        attempts = self.cfg.max_retries + 1
-        for attempt in range(1, attempts + 1):
+        max_attempts = self.cfg.max_retries + 1
+        attempt, late_retries = 1, 0
+        while True:
             tmp = cell / f"run{r}.tmp"
             shutil.rmtree(tmp, ignore_errors=True)
             tmp.mkdir(parents=True)
-            results, cores, meta = self._execute(setup, sandboxes, bench, n, r, tmp)
-            ok = all(c.rc == 0 and c.data and c.data.get("valid") for c in results)
-            self._write_run(tmp, results, cores, meta | {"attempt": attempt, "accepted": ok})
-            log.info("%s n=%d run%d attempt %d: %s", bench.name, n, r, attempt, "ok" if ok else "INVALID")
+            results, cores, procs, meta = self._execute(setup, sandboxes, bench, n, r, tmp)
             run(["conntrack", "-F"], check=False)
-            if ok or attempt == attempts:
+            if meta["late_start"] and late_retries < 5:
+                # The clients could not start by the agreed time. That is a launch-timing problem, not a bad
+                # measurement: lengthen the lead and redo the run without using up an attempt.
+                late_retries += 1
+                self.lead_extra += max(3.0, 0.5 * meta["lead_s"])
+                log.warning("clients started too late (lead %.0fs); lead extended by %.0fs for the rest of the session; redoing",
+                            meta["lead_s"], max(3.0, 0.5 * meta["lead_s"]))
+                shutil.rmtree(tmp, ignore_errors=True)
+                time.sleep(2)
+                continue
+            ok = all(c.rc == 0 and c.data and c.data.get("valid") for c in results)
+            self._write_run(tmp, results, cores, procs, meta | {"attempt": attempt, "accepted": ok})
+            log.info("%s n=%d run%d attempt %d: %s", bench.name, n, r, attempt, "ok" if ok else "INVALID")
+            if ok or attempt == max_attempts:
                 tmp.rename(final)
                 break
             tmp.rename(cell / f"run{r}.rejected{attempt}")
+            attempt += 1
             time.sleep(2)
         time.sleep(1)
 
@@ -166,6 +200,7 @@ class Runner:
         start_at = time.time() + lead
         timeout = lead + bench.warmup + bench.duration + 30
         sampler = CoreSampler()
+        procs = ProcSampler(setup.processes())
 
         def one(sb: Sandbox) -> ClientResult:
             labels = {"setup": setup.id, "scenario": SCENARIO, "bench": bench.name, "n": n, "run": r, "sandbox": sb.name}
@@ -181,19 +216,19 @@ class Runner:
                 return ClientResult(sb, -1, "", "orchestrator timeout", None)
 
         sampler.start()
+        procs.start()
         t0 = time.time()
         with ThreadPoolExecutor(max_workers=n) as ex:
             results = list(ex.map(one, sandboxes))
         t1 = time.time()
         cores = sampler.stop()
-        if any("start-at" in c.stderr for c in results):      # clients could not start in time: grow the lead
-            self.lead_extra += 3.0
-            log.warning("start lead too short, increasing by 3s (now +%.0fs)", self.lead_extra)
-        meta = {"start_at": start_at, "lead_s": lead, "launched_unix": t0, "finished_unix": t1,
+        procs_data = procs.stop()
+        late = any("start-at" in c.stderr for c in results)
+        meta = {"late_start": late, "start_at": start_at, "lead_s": lead, "launched_unix": t0, "finished_unix": t1,
                 "bench": bench.name, "cmd": bench.cmd, "args": bench.args, "n": n, "run": r}
-        return results, cores, meta
+        return results, cores, procs_data, meta
 
-    def _write_run(self, d: Path, results: list[ClientResult], cores: dict, meta: dict):
+    def _write_run(self, d: Path, results: list[ClientResult], cores: dict, procs: dict, meta: dict):
         log_lines = []
         for c in results:
             if c.data is not None:
@@ -203,6 +238,8 @@ class Runner:
                 (d / f"{c.sb.name}.stdout").write_text(c.stdout)
         (d / "stderr.log").write_text("\n".join(log_lines) + "\n")
         (d / "cores.json").write_text(json.dumps(cores) + "\n")
+        if any(g["instances"] for g in procs["groups"].values()):      # only setups that have processes of their own
+            (d / "procs.json").write_text(json.dumps(procs) + "\n")
         meta = meta | {"rc": {c.sb.name: c.rc for c in results},
                        "valid": {c.sb.name: bool(c.data and c.data.get("valid")) for c in results}}
         (d / "run.json").write_text(json.dumps(meta, indent=2) + "\n")

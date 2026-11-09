@@ -16,7 +16,7 @@ import (
 
 func runServer(args []string) error {
 	fs := flag.NewFlagSet("server", flag.ContinueOnError)
-	listen := fs.String("listen", ":9000", "comma-separated listen addresses, e.g. :9001,:9002 or 10.0.0.5:9000")
+	listen := fs.String("listen", ":9000", "comma-separated listen addresses, e.g. :9001,:9002, 10.0.0.5:9000 or unix:/path/to.sock")
 	procs := fs.Int("procs", 0, "GOMAXPROCS (0 = Go default)")
 	if err := fs.Parse(args); err != nil {
 		return &exitErr{2, ""}
@@ -30,9 +30,17 @@ func runServer(args []string) error {
 		if a == "" {
 			continue
 		}
-		ln, err := net.Listen("tcp", a)
+		network, addr := "tcp", a
+		if path, ok := strings.CutPrefix(a, "unix:"); ok {
+			os.Remove(path) // a stale socket file from an earlier run
+			network, addr = "unix", path
+		}
+		ln, err := net.Listen(network, addr)
 		if err != nil {
 			return &exitErr{2, err.Error()}
+		}
+		if network == "unix" {
+			os.Chmod(addr, 0o666)
 		}
 		lns = append(lns, ln)
 		fmt.Fprintf(os.Stderr, "netbench server listening on %s\n", ln.Addr())

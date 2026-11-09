@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 )
 
@@ -18,6 +19,7 @@ import (
 //	            /etc/resolv.conf directly, the same in every sandbox.
 type target struct {
 	spec      string
+	network   string // "tcp4", or "unix" for targets written as unix:/path
 	dialAddr  string
 	resolved  string
 	nResolved int
@@ -26,11 +28,14 @@ type target struct {
 }
 
 func resolveTarget(spec, mode string, timeout time.Duration) (*target, error) {
+	if path, ok := strings.CutPrefix(spec, "unix:"); ok { // a Unix socket: no name resolution
+		return &target{spec: spec, network: "unix", dialAddr: path, resolved: spec, nResolved: 1, mode: "unix"}, nil
+	}
 	host, port, err := net.SplitHostPort(spec)
 	if err != nil {
 		return nil, fmt.Errorf("bad --target %q: %w", spec, err)
 	}
-	t := &target{spec: spec, dialAddr: spec, mode: mode}
+	t := &target{spec: spec, network: "tcp4", dialAddr: spec, mode: mode}
 	if net.ParseIP(host) != nil {
 		t.mode, t.resolved, t.nResolved = "literal", spec, 1
 		return t, nil
@@ -56,7 +61,7 @@ func resolveTarget(spec, mode string, timeout time.Duration) (*target, error) {
 
 func (t *target) dial(timeout time.Duration) (net.Conn, error) {
 	d := net.Dialer{Timeout: timeout}
-	c, err := d.Dial("tcp4", t.dialAddr)
+	c, err := d.Dial(t.network, t.dialAddr)
 	if err == nil {
 		if tc, ok := c.(*net.TCPConn); ok {
 			tc.SetNoDelay(true)

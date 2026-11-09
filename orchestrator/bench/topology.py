@@ -51,7 +51,7 @@ class Topology:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.procs: list[subprocess.Popen] = []
-        self._old_fwd = "0"
+        self._old_fwd: str | None = None      # None until up() has captured the host value
         self._fw_chain: str | None = None
 
     def up(self):
@@ -169,7 +169,9 @@ class Topology:
             self._revoke_forwarding()
         run(["ip", "netns", "del", TARGET_NS], check=False)
         run(["ip", "link", "del", TARGET_HOST_IF], check=False)
-        try:
-            Path("/proc/sys/net/ipv4/ip_forward").write_text(self._old_fwd)
-        except OSError:
-            pass
+        if self._old_fwd is not None:                  # only restore what up() actually changed
+            try:
+                Path("/proc/sys/net/ipv4/ip_forward").write_text(self._old_fwd)
+            except OSError:
+                pass
+            self._old_fwd = None

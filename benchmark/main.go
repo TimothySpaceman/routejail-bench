@@ -1,7 +1,8 @@
 // netbench: one binary for the benchmark client (runs inside each sandbox) and the target server.
 //
 //	netbench server  --listen :9001,:9002
-//	netbench probe   --target db.sandbox:9001 --expect ok|blocked
+//	netbench relay   --listen 127.0.0.1:9000 --unix /sock/proxy.sock [--stats FILE]
+//	netbench probe   --target db.sandbox:9001 --expect ok|blocked  (targets may be unix:/path)
 //	netbench ttfb    --target HOST:PORT --rate 200 --size 64
 //	netbench latency --target HOST:PORT --rate 500 --conns 2 --size 64
 //	netbench tput    --target HOST:PORT --dir up|down --streams 4
@@ -21,6 +22,7 @@ func usage() {
 
 commands:
   server    target server: echo, sink and source on any number of ports
+  relay     inside a network-less sandbox: loopback TCP port -> host Unix socket, byte for byte
   probe     one connect + echo round trip; --expect ok|blocked checks reachability
   ttfb      new connection per request, open loop; reports TTFB and connect-time histograms
   latency   persistent connections, open-loop ping-pong; reports latency histogram
@@ -39,6 +41,8 @@ func main() {
 	switch os.Args[1] {
 	case "server":
 		err = runServer(os.Args[2:])
+	case "relay":
+		err = runRelay(os.Args[2:])
 	case "probe":
 		err = runProbe(os.Args[2:])
 	case "ttfb":

@@ -2,16 +2,23 @@ experiment = "first-try"
 results_dir = "results"
 netbench = "./netbench"       # static build: CGO_ENABLED=0 go build -o netbench .
 
-runtime = "netns"             # netns (dev/test of the host plumbing) | docker
+runtime = "docker"             # netns (dev/test of the host plumbing) | docker
 docker_runtime = ""           # "runsc" for gVisor, "" for the default runtime
-docker_image = "busybox:latest"
+docker_image = "mcr.microsoft.com/dotnet/runtime-deps:10.0"   # one glibc image for ALL setups (the sidecar needs it); any recent runtime-deps tag works
 
-setups = ["0", "1"]
+setups = ["1", "2", "3", "4"]   # 1 kernel, 2 Envoy over the network, 3 Envoy over a socket, 4 router (add "0" for a no-policy baseline)
 ns = [1, 5, 10, 20, 50]
 runs = 3
 max_retries = 2               # re-runs of a run whose clients reported valid=false
 lead_base_s = 3.0             # start lead = this + N * (cost of launching one client)
+# launch_cost_s = 1.0         # override the per-client launch cost (defaults: netns 0.05, docker 0.4, gVisor 1.0)
+envoy = "envoy"               # Envoy binary for setups 2 and 3 (path or name on PATH); keep the version fixed across a series
 seed = 1
+
+# Setup 4 (the custom router and sidecar) needs these three. Both programs must be built for THIS machine (-r linux-x64), not on a Mac.
+router     = "/opt/routejail/router/Router"       # command that starts the router on the host
+router_url = "http://127.0.0.1:5010"          # its REST API (passed to it as ASPNETCORE_URLS)
+sidecar    = "/opt/routejail/sidecar/Sidecar"     # self-contained native executable, mounted into every sandbox
 
 [cores]                       # 6-core layout; adjust to the machine (SMT siblings off)
 os = "0"                      # OS, Docker, orchestrator, host-side helper server
