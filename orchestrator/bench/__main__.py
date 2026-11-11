@@ -12,7 +12,7 @@ from pathlib import Path
 
 from . import config as cfgmod
 from .plan import build_plan, format_plan
-from .preflight import Finding, envoy_version, is_dynamic_elf, router_findings, setup_findings, tuning_findings, uds_selftest
+from .preflight import Finding, envoy_version, is_dynamic_elf, router_findings, setup_findings, tuning_findings, uds_create_selftest, uds_selftest
 from .runner import Runner
 from .runtime import make_runtime
 from .sh import log, run
@@ -89,6 +89,10 @@ def cmd_check(cfg) -> int:
         ok, detail = uds_selftest(cfg)
         rep("OK" if ok else "FAIL", "sandbox can reach a host Unix socket (needed by setups 3 and 4)",
             "" if ok else detail + (" | gVisor needs runsc started with --host-uds=open (see README.md)" if cfg.docker_runtime else ""))
+    if "3" in cfg.setups and "peer" in cfg.scenarios and cfg.runtime == "docker" and nb.exists():
+        ok, detail = uds_create_selftest(cfg)
+        rep("OK" if ok else "FAIL", "sandbox can create a Unix socket the host can reach (setup 3, peer scenario)",
+            "" if ok else detail + (" | gVisor needs runsc started with --host-uds=all (see README.md)" if cfg.docker_runtime else ""))
     for f in tuning_findings(cfg):
         rep(f.level, f.what + " (blocks `run`, only warned by `smoke`)" if f.level == "FAIL" else f.what, f.fix)
     return 1 if problems else 0

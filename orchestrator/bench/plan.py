@@ -39,16 +39,20 @@ def build_plan(cfg: Config, launch_cost: float | None = None) -> dict:
             secs = n * SANDBOX_COST[rk] + PROBE_BASE_S + 0.05 * n + EXTRA_PER_GROUP.get(setup_id, 0.0)
             runs = files = size = 0
             done_cells = 0
-            for b in cfg.benchmarks:
-                per_run = cfg.lead_base_s + n * launch_cost + b.warmup + b.duration + RUN_GAP_S
-                secs += cfg.runs * per_run
-                runs += cfg.runs
-                files += cfg.runs * (n + 3)
-                size += cfg.runs * (n * SANDBOX_JSON.get(b.cmd, 3000) + RUN_FILES + (PROCS_JSON if setup_id in EXTRA_PER_GROUP else 0))
-                if known and (out_dir / SETUPS[setup_id].slug / "outbound" / b.name / f"n{n}" / "done.json").exists():
-                    done_cells += 1
+            scenarios = [s for s in cfg.scenarios if s != "peer" or n >= 2]      # the peer scenario needs at least two sandboxes
+            if "peer" in scenarios:
+                secs += n * 0.3 + 5.0                                           # starting a server in every sandbox and checking the peer path
+            for scenario in scenarios:
+                for b in cfg.benchmarks:
+                    per_run = cfg.lead_base_s + n * launch_cost + b.warmup + b.duration + RUN_GAP_S
+                    secs += cfg.runs * per_run
+                    runs += cfg.runs
+                    files += cfg.runs * (n + 3)
+                    size += cfg.runs * (n * SANDBOX_JSON.get(b.cmd, 3000) + RUN_FILES + (PROCS_JSON if setup_id in EXTRA_PER_GROUP else 0))
+                    if known and (out_dir / SETUPS[setup_id].slug / scenario / b.name / f"n{n}" / "done.json").exists():
+                        done_cells += 1
             groups.append({"setup": setup_id, "slug": SETUPS[setup_id].slug if known else f"setup {setup_id} (not built)", "n": n, "runs": runs,
-                           "est_min": secs / 60, "done_cells": done_cells, "cells": len(cfg.benchmarks), "implemented": known})
+                           "est_min": secs / 60, "done_cells": done_cells, "cells": len(scenarios) * len(cfg.benchmarks), "implemented": known})
             if known:
                 total_s += secs
                 total_runs += runs
@@ -60,7 +64,7 @@ def build_plan(cfg: Config, launch_cost: float | None = None) -> dict:
 
 def format_plan(cfg: Config, plan: dict) -> str:
     L = [f"experiment: {plan['experiment']}   runtime: {plan['runtime']}   results: {cfg.results_dir / cfg.experiment}",
-         f"setups {cfg.setups} x N {cfg.ns} x {len(cfg.benchmarks)} benchmarks x {cfg.runs} runs   (client launch cost {plan['launch_cost_s']} s)",
+         f"setups {cfg.setups} x N {cfg.ns} x scenarios {cfg.scenarios} x {len(cfg.benchmarks)} benchmarks x {cfg.runs} runs   (client launch cost {plan['launch_cost_s']} s)",
          "", f"{'setup':26}{'N':>4}{'runs':>6}{'est. min':>10}   state"]
     for g in plan["groups"]:
         state = "NOT IMPLEMENTED" if not g["implemented"] else ("done" if g["done_cells"] == g["cells"] else

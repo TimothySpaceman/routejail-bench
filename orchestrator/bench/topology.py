@@ -28,6 +28,8 @@ TARGET_NAME = "target.bench"
 PORT_ALLOWED = 9000     # the benchmark target port
 PORT_FORBIDDEN = 9999   # a live server on the target that policy setups must block
 PORT_HOST = 9998        # a live server on the host: sandbox->host must be blocked
+PORT_PEER = 9100        # the peer scenario: every sandbox runs a server here, its client talks to the next sandbox's
+PEER_NAME = "peer.bench"
 
 
 # Interfaces whose forwarded traffic the host firewall must not drop. Docker (and ufw) set the iptables
@@ -39,7 +41,8 @@ FW_TAG = ["-m", "comment", "--comment", "bench"]
 # Docker >= 28 installs, per container, `-d <container ip> ! -i <its bridge> -j DROP` in the *raw* PREROUTING chain.
 # That chain runs before conntrack and before DOCKER-USER, so it also drops the target's replies (they arrive on
 # the target veth, addressed to the sandbox). One ACCEPT for traffic coming from the target veth fixes that.
-RAW_RULE = ["-t", "raw", "-i", TARGET_HOST_IF, "-d", "10.100.0.0/16"]
+# (traffic from the target veth, and traffic between sandbox bridges for the peer scenario)
+RAW_RULES = [["-t", "raw", "-i", TARGET_HOST_IF, "-d", "10.100.0.0/16"], ["-t", "raw", "-i", "bsb+", "-d", "10.100.0.0/16"]]
 
 
 def sandbox_net(idx: int) -> tuple[str, str, str]:
@@ -93,15 +96,18 @@ class Topology:
         possibly at the top of the chain, so our ACCEPT must be (re)inserted afterwards, at position 1."""
         if not shutil.which("iptables"):
             return
-        while run(["iptables", "-w", "5", "-D", "PREROUTING", *RAW_RULE, *FW_TAG, "-j", "ACCEPT"], check=False).returncode == 0:
-            pass
-        cp = run(["iptables", "-w", "5", "-I", "PREROUTING", "1", *RAW_RULE, *FW_TAG, "-j", "ACCEPT"], check=False)
-        if cp.returncode == 0:
-            log.info("allowed replies from the target to sandbox addresses in the raw table (Docker 28+ direct-routing filter)")
+        ok = True
+        for rule in RAW_RULES:
+            while run(["iptables", "-w", "5", "-D", "PREROUTING", *rule, *FW_TAG, "-j", "ACCEPT"], check=False).returncode == 0:
+                pass
+            ok &= run(["iptables", "-w", "5", "-I", "PREROUTING", "1", *rule, *FW_TAG, "-j", "ACCEPT"], check=False).returncode == 0
+        if ok:
+            log.info("allowed traffic to sandbox addresses in the raw table (Docker 28+ direct-routing filter)")
 
     def _revoke_forwarding(self):
-        while run(["iptables", "-w", "5", "-D", "PREROUTING", *RAW_RULE, *FW_TAG, "-j", "ACCEPT"], check=False).returncode == 0:
-            pass
+        for rule in RAW_RULES:
+            while run(["iptables", "-w", "5", "-D", "PREROUTING", *rule, *FW_TAG, "-j", "ACCEPT"], check=False).returncode == 0:
+                pass
         chains = {self._fw_chain} if self._fw_chain else {"DOCKER-USER", "FORWARD"}   # also cleans after a crash
         for chain in chains:
             for m in FW_MATCHES:

@@ -44,6 +44,7 @@ class Config:
     max_retries: int
     lead_base_s: float
     launch_cost_s: float | None   # seconds to start one client in a sandbox; None = runtime default
+    scenarios: list[str]          # outbound (sandbox -> target) and/or peer (sandbox -> sandbox, in a ring)
     envoy: str                    # envoy binary (path or name on PATH), used by setups 2 and 3
     envoy_admin_port: int
     router: str                   # command that starts the router on the host (setup 4), e.g. "/opt/router/Router"
@@ -80,6 +81,9 @@ def load(path: str | Path) -> Config:
         Bench(b["name"], b["cmd"], [str(x) for x in b.get("args", [])], float(b["warmup"]), float(b["duration"]))
         for b in raw.get("benchmark", [])
     ]
+    bad = [x for x in raw.get("scenarios", ["outbound"]) if x not in ("outbound", "peer")]
+    if bad:
+        raise ValueError(f'unknown scenario {bad}: use "outbound" and/or "peer"')
     return Config(
         experiment=raw.get("experiment", "experiment"),
         results_dir=(base / raw.get("results_dir", "results")).resolve(),
@@ -94,6 +98,7 @@ def load(path: str | Path) -> Config:
         max_retries=int(raw.get("max_retries", 2)),
         lead_base_s=float(raw.get("lead_base_s", 3.0)),
         launch_cost_s=(float(raw["launch_cost_s"]) if "launch_cost_s" in raw else None),
+        scenarios=[str(x) for x in raw.get("scenarios", ["outbound"])],
         envoy=raw.get("envoy", "envoy"),
         envoy_admin_port=int(raw.get("envoy_admin_port", 9901)),
         router=raw.get("router", ""),

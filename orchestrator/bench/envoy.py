@@ -20,27 +20,34 @@ from .topology import PORT_ALLOWED, TARGET_IP
 TCP_PROXY = "type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy"
 
 
-def tcp_listener(name: str, address: str, port: int) -> dict:
-    return {"name": name, "address": {"socket_address": {"address": address, "port_value": port}}}
+def tcp_listener(name: str, address: str, port: int, cluster: str = "target") -> dict:
+    return {"name": name, "cluster": cluster, "address": {"socket_address": {"address": address, "port_value": port}}}
 
 
-def pipe_listener(name: str, path: str) -> dict:
-    return {"name": name, "address": {"pipe": {"path": path, "mode": 0o666}}}
+def pipe_listener(name: str, path: str, cluster: str = "target") -> dict:
+    return {"name": name, "cluster": cluster, "address": {"pipe": {"path": path, "mode": 0o666}}}
 
 
-def envoy_config(listeners: list[dict], admin_port: int, target_ip: str = TARGET_IP, target_port: int = PORT_ALLOWED) -> dict:
+def _cluster(name: str, address: dict) -> dict:
+    return {"name": name, "type": "STATIC", "connect_timeout": "5s",
+            "load_assignment": {"cluster_name": name, "endpoints": [{"lb_endpoints": [{"endpoint": {"address": address}}]}]}}
+
+
+def envoy_config(listeners: list[dict], admin_port: int, target_ip: str = TARGET_IP, target_port: int = PORT_ALLOWED,
+                 peer_clusters: list[tuple[str, dict]] | None = None) -> dict:
+    """peer_clusters: (name, address) pairs, one per peer edge; address is a socket_address or pipe dict."""
     """The whole configuration as plain data (JSON is valid YAML, so Envoy reads it as it is)."""
     return {
         "admin": {"address": {"socket_address": {"address": "127.0.0.1", "port_value": admin_port}}},
         # silence the "no configured limit to downstream connections" warning without limiting anything
         "layered_runtime": {"layers": [{"name": "static", "static_layer": {"overload": {"global_downstream_max_connections": 1000000}}}]},
         "static_resources": {
-            "listeners": [dict(l, filter_chains=[{"filters": [{"name": "envoy.filters.network.tcp_proxy",
-                                                               "typed_config": {"@type": TCP_PROXY, "stat_prefix": l["name"], "cluster": "target"}}]}])
+            "listeners": [{**{k: v for k, v in l.items() if k != "cluster"},
+                           "filter_chains": [{"filters": [{"name": "envoy.filters.network.tcp_proxy",
+                                                           "typed_config": {"@type": TCP_PROXY, "stat_prefix": l["name"], "cluster": l.get("cluster", "target")}}]}]}
                           for l in listeners],
-            "clusters": [{"name": "target", "type": "STATIC", "connect_timeout": "5s",
-                          "load_assignment": {"cluster_name": "target", "endpoints": [{"lb_endpoints": [
-                              {"endpoint": {"address": {"socket_address": {"address": target_ip, "port_value": target_port}}}}]}]}}],
+            "clusters": [_cluster("target", {"socket_address": {"address": target_ip, "port_value": target_port}}),
+                         *[_cluster(n, a) for n, a in (peer_clusters or [])]],
         },
     }
 
@@ -54,10 +61,10 @@ class EnvoyProxy:
     def pid(self) -> int:
         return self.proc.pid if self.proc else 0
 
-    def start(self, listeners: list[dict]):
+    def start(self, listeners: list[dict], peer_clusters: list[tuple[str, dict]] | None = None):
         self.workdir.mkdir(parents=True, exist_ok=True)
         conf = self.workdir / f"envoy-{self.tag}.yaml"
-        conf.write_text(json.dumps(envoy_config(listeners, self.cfg.envoy_admin_port), indent=1) + "\n")
+        conf.write_text(json.dumps(envoy_config(listeners, self.cfg.envoy_admin_port, peer_clusters=peer_clusters), indent=1) + "\n")
         v = run([self.cfg.envoy, "--mode", "validate", "-c", str(conf)], check=False, timeout=90)
         if v.returncode != 0:
             raise RuntimeError(f"Envoy rejected its configuration ({conf}):\n{(v.stderr or v.stdout).strip()[-800:]}")

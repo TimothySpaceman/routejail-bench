@@ -14,9 +14,12 @@ import (
 	"time"
 )
 
-// relay runs INSIDE a sandbox that has no network. It listens on a loopback TCP port and forwards every
-// connection, byte for byte, to a Unix socket that the host mounted into the sandbox. The program inside
-// the sandbox keeps using ordinary TCP (to 127.0.0.1); the host side of the socket is the proxy.
+// relay runs INSIDE a sandbox that has no network and forwards every connection, byte for byte, between two
+// addresses, each either TCP (host:port) or a Unix socket (unix:/path):
+//
+//	out:  --listen 127.0.0.1:9000        --to unix:/sock/proxy.sock   the program in the sandbox keeps using plain TCP;
+//	                                                                  the host side of the socket is the proxy
+//	in:   --listen unix:/sock/in.sock    --to 127.0.0.1:9100          the host reaches a server inside the sandbox
 //
 // With --stats FILE the relay appends one JSON line per second about itself (CPU time, memory, open
 // connections). The orchestrator reads that file from the host, so the relay's cost can be recorded
@@ -24,42 +27,61 @@ import (
 
 func runRelay(args []string) error {
 	fs := flag.NewFlagSet("relay", flag.ContinueOnError)
-	listen := fs.String("listen", "127.0.0.1:9000", "TCP address to listen on inside the sandbox")
-	unixPath := fs.String("unix", "", "Unix socket every connection is forwarded to (required)")
+	listen := fs.String("listen", "127.0.0.1:9000", "address to listen on: host:port, or unix:/path")
+	to := fs.String("to", "", "address every connection is forwarded to: host:port, or unix:/path")
+	unixPath := fs.String("unix", "", "same as --to unix:PATH (kept for older callers)")
 	stats := fs.String("stats", "", "append one JSON line per second with this process's CPU time and memory to FILE")
 	procs := fs.Int("procs", 0, "GOMAXPROCS (0 = Go default)")
 	if err := fs.Parse(args); err != nil {
 		return &exitErr{2, ""}
 	}
-	if *unixPath == "" {
-		return usageErr("--unix is required")
+	target := *to
+	if target == "" && *unixPath != "" {
+		target = "unix:" + *unixPath
+	}
+	if target == "" {
+		return usageErr("--to (or --unix) is required")
 	}
 	if *procs > 0 {
 		runtime.GOMAXPROCS(*procs)
 	}
-	ln, err := net.Listen("tcp4", *listen)
+	network, addr := "tcp4", *listen
+	if path, ok := strings.CutPrefix(*listen, "unix:"); ok {
+		os.Remove(path) // a stale socket file from an earlier run
+		network, addr = "unix", path
+	}
+	ln, err := net.Listen(network, addr)
 	if err != nil {
 		return &exitErr{2, err.Error()}
+	}
+	if network == "unix" {
+		os.Chmod(addr, 0o666)
 	}
 	var active atomic.Int64
 	if *stats != "" {
 		go statsLoop(*stats, &active)
 	}
-	fmt.Fprintf(os.Stderr, "netbench relay listening on %s -> unix:%s\n", ln.Addr(), *unixPath)
+	fmt.Fprintf(os.Stderr, "netbench relay listening on %s -> %s\n", *listen, target)
+	dialNet, dialAddr := "tcp4", target
+	if path, ok := strings.CutPrefix(target, "unix:"); ok {
+		dialNet, dialAddr = "unix", path
+	}
 	for {
 		c, err := ln.Accept()
 		if err != nil {
 			return err
 		}
-		go relayConn(c, *unixPath, &active)
+		go relayConn(c, dialNet, dialAddr, &active)
 	}
 }
 
-func relayConn(c net.Conn, path string, active *atomic.Int64) {
+type closeWriter interface{ CloseWrite() error }
+
+func relayConn(c net.Conn, network, addr string, active *atomic.Int64) {
 	defer c.Close()
 	active.Add(1)
 	defer active.Add(-1)
-	u, err := net.DialTimeout("unix", path, 5*time.Second)
+	u, err := net.DialTimeout(network, addr, 5*time.Second)
 	if err != nil {
 		return
 	}
@@ -67,18 +89,21 @@ func relayConn(c net.Conn, path string, active *atomic.Int64) {
 	if tc, ok := c.(*net.TCPConn); ok {
 		tc.SetNoDelay(true)
 	}
+	if tc, ok := u.(*net.TCPConn); ok {
+		tc.SetNoDelay(true)
+	}
 	done := make(chan struct{}, 2)
-	go func() { // sandbox -> host
+	go func() { // listening side -> destination
 		io.Copy(u, c)
-		if uc, ok := u.(*net.UnixConn); ok {
-			uc.CloseWrite()
+		if w, ok := u.(closeWriter); ok {
+			w.CloseWrite()
 		}
 		done <- struct{}{}
 	}()
-	go func() { // host -> sandbox
+	go func() { // destination -> listening side
 		io.Copy(c, u)
-		if tc, ok := c.(*net.TCPConn); ok {
-			tc.CloseWrite()
+		if w, ok := c.(closeWriter); ok {
+			w.CloseWrite()
 		}
 		done <- struct{}{}
 	}()

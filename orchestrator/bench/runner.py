@@ -21,7 +21,11 @@ from .setups import Setup, kill_leftovers, make_setup
 from .sh import log, run
 from .topology import Topology
 
-SCENARIO = "outbound"
+
+
+def scenarios_for(cfg, n: int) -> list[str]:
+    """The scenarios that run with n sandboxes: the peer scenario needs at least two."""
+    return [s for s in cfg.scenarios if s != "peer" or n >= 2]
 
 
 class ProbeFailure(RuntimeError):
@@ -74,7 +78,7 @@ class Runner:
                 self.run_group(setup_id, n)
             except Exception:
                 log.error("group setup=%s n=%d FAILED\n%s", setup_id, n, traceback.format_exc())
-                gdir = self._group_dir(setup_id, n)
+                gdir = self._group_dir(setup_id, n, scenarios_for(self.cfg, n)[0])
                 gdir.mkdir(parents=True, exist_ok=True)
                 (gdir / "failed.json").write_text(json.dumps({"error": traceback.format_exc()}, indent=2))
 
@@ -95,16 +99,16 @@ class Runner:
             log.warning("continuing despite differences from the first session:\n  %s", "\n  ".join(diffs))
         manifest.write(self.out / f"manifest.session-{int(time.time())}.json", new)
 
-    def _group_dir(self, setup_id: str, n: int) -> Path:
+    def _group_dir(self, setup_id: str, n: int, scenario: str) -> Path:
         from .setups import SETUPS
-        return self.out / SETUPS[setup_id].slug / SCENARIO / f"n{n}"
+        return self.out / SETUPS[setup_id].slug / scenario / f"n{n}"
 
-    def _cell_dir(self, setup_id: str, n: int, bench: Bench) -> Path:
+    def _cell_dir(self, setup_id: str, n: int, bench: Bench, scenario: str) -> Path:
         from .setups import SETUPS
-        return self.out / SETUPS[setup_id].slug / SCENARIO / bench.name / f"n{n}"
+        return self.out / SETUPS[setup_id].slug / scenario / bench.name / f"n{n}"
 
     def _group_done(self, setup_id: str, n: int) -> bool:
-        return all((self._cell_dir(setup_id, n, b) / "done.json").exists() for b in self.cfg.benchmarks)
+        return all((self._cell_dir(setup_id, n, b, sc) / "done.json").exists() for sc in scenarios_for(self.cfg, n) for b in self.cfg.benchmarks)
 
     # ---------- one group: N sandboxes of one setup, all benchmarks, all runs ----------
 
@@ -113,20 +117,26 @@ class Runner:
         self.rt.cleanup_all()
         kill_leftovers(self.cfg)
         setup = make_setup(setup_id, self.cfg, self.rt)
-        setup.workdir = self._group_dir(setup_id, n) / "mediator"
+        scenarios = scenarios_for(self.cfg, n)
+        setup.scenarios = scenarios
+        setup.workdir = self._group_dir(setup_id, n, scenarios[0]) / "mediator"
         self.topo.up()
         try:
             self.topo.start_servers()
             sandboxes = setup.up(n)
             self.topo.allow_replies()
-            self._probe_group(setup, sandboxes, self._group_dir(setup_id, n))
-            for bench in self.cfg.benchmarks:
-                cell = self._cell_dir(setup_id, n, bench)
-                if (cell / "done.json").exists():
-                    continue
-                for r in range(1, self.cfg.runs + 1):
-                    self._run_one(setup, sandboxes, bench, n, r, cell)
-                (cell / "done.json").write_text(json.dumps({"finished_unix": time.time()}) + "\n")
+            if setup.wants_peer(n):
+                setup.start_peer_servers()
+                setup.wait_peer_ready()
+            for scenario in scenarios:
+                self._probe_group(setup, sandboxes, self._group_dir(setup_id, n, scenario), scenario)
+                for bench in self.cfg.benchmarks:
+                    cell = self._cell_dir(setup_id, n, bench, scenario)
+                    if (cell / "done.json").exists():
+                        continue
+                    for r in range(1, self.cfg.runs + 1):
+                        self._run_one(setup, sandboxes, bench, n, r, cell, scenario)
+                    (cell / "done.json").write_text(json.dumps({"finished_unix": time.time()}) + "\n")
         finally:
             for step in (setup.down, self.topo.down):
                 try:
@@ -136,7 +146,7 @@ class Runner:
 
     # ---------- probes ----------
 
-    def _probe_group(self, setup: Setup, sandboxes: list[Sandbox], gdir: Path):
+    def _probe_group(self, setup: Setup, sandboxes: list[Sandbox], gdir: Path, scenario: str = "outbound"):
         gdir.mkdir(parents=True, exist_ok=True)
 
         def one(item):
@@ -147,7 +157,7 @@ class Runner:
             return {"sandbox": sb.name, "probe": p.label, "target": p.target, "expect": p.expect,
                     "rc": cp.returncode, "result": _jsonline(cp.stdout)}
 
-        items = [(sb, p) for sb in sandboxes for p in setup.probes(sb)]
+        items = [(sb, p) for sb in sandboxes for p in setup.probes(sb, scenario)]
         with ThreadPoolExecutor(max_workers=min(len(items), 32)) as ex:
             results = list(ex.map(one, items))
         (gdir / "probes.json").write_text(json.dumps(results, indent=2) + "\n")
@@ -162,7 +172,7 @@ class Runner:
 
     # ---------- one run (with retries for invalid results) ----------
 
-    def _run_one(self, setup: Setup, sandboxes: list[Sandbox], bench: Bench, n: int, r: int, cell: Path):
+    def _run_one(self, setup: Setup, sandboxes: list[Sandbox], bench: Bench, n: int, r: int, cell: Path, scenario: str = "outbound"):
         final = cell / f"run{r}"
         if final.exists():
             return
@@ -172,7 +182,7 @@ class Runner:
             tmp = cell / f"run{r}.tmp"
             shutil.rmtree(tmp, ignore_errors=True)
             tmp.mkdir(parents=True)
-            results, cores, procs, meta = self._execute(setup, sandboxes, bench, n, r, tmp)
+            results, cores, procs, meta = self._execute(setup, sandboxes, bench, n, r, tmp, scenario)
             run(["conntrack", "-F"], check=False)
             if meta["late_start"] and late_retries < 5:
                 # The clients could not start by the agreed time. That is a launch-timing problem, not a bad
@@ -195,7 +205,7 @@ class Runner:
             time.sleep(2)
         time.sleep(1)
 
-    def _execute(self, setup, sandboxes, bench: Bench, n: int, r: int, tmp: Path):
+    def _execute(self, setup, sandboxes, bench: Bench, n: int, r: int, tmp: Path, scenario: str = "outbound"):
         lead = self.cfg.lead_base_s + n * self.rt.launch_cost_s + self.lead_extra
         start_at = time.time() + lead
         timeout = lead + bench.warmup + bench.duration + 30
@@ -203,8 +213,8 @@ class Runner:
         procs = ProcSampler(setup.processes())
 
         def one(sb: Sandbox) -> ClientResult:
-            labels = {"setup": setup.id, "scenario": SCENARIO, "bench": bench.name, "n": n, "run": r, "sandbox": sb.name}
-            argv = [self.rt.binary, bench.cmd, "--target", setup.target_for(sb),
+            labels = {"setup": setup.id, "scenario": scenario, "bench": bench.name, "n": n, "run": r, "sandbox": sb.name}
+            argv = [self.rt.binary, bench.cmd, "--target", setup.target_for(sb, scenario),
                     "--warmup", f"{bench.warmup:g}s", "--duration", f"{bench.duration:g}s",
                     "--start-at", f"{start_at:.3f}", "--phase-key", sb.name, *bench.args]
             for k, v in labels.items():

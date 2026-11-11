@@ -25,7 +25,7 @@ from .procs import ProcSpec
 from .router_api import RouterApi, stable_id
 from .runtime import Runtime, Sandbox
 from .sh import log, run
-from .topology import PORT_ALLOWED, PORT_FORBIDDEN, PORT_HOST, TARGET_IP, TARGET_NAME, sandbox_net
+from .topology import PEER_NAME, PORT_ALLOWED, PORT_FORBIDDEN, PORT_HOST, PORT_PEER, TARGET_IP, TARGET_NAME, sandbox_net
 
 RUN_DIR = Path("/run/bench")      # per-sandbox socket directories (setup 3)
 
@@ -46,23 +46,48 @@ class Setup(ABC):
         self.cfg, self.rt = cfg, runtime
         self.sandboxes: list[Sandbox] = []
         self.workdir: Path = Path("/tmp/bench-work")     # set by the runner: where config and logs of the mediator go
+        self.scenarios: list[str] = ["outbound"]         # set by the runner before up()
+        self._peer = False
 
-    def _create_sandboxes(self, n: int, target_ip=None):
-        # Every setup resolves the target by name, so name handling is exercised everywhere.
-        # target_ip(i) tells which address `target.bench` has inside sandbox i (default: the real target).
-        self.sandboxes = [self.rt.create(i, net="routed", hosts={TARGET_NAME: target_ip(i) if target_ip else TARGET_IP},
-                                         cpus=self.cfg.cores["sandbox"]) for i in range(1, n + 1)]
+    # Peer scenario: sandboxes form a ring, the client in sandbox i talks to the server in sandbox i+1 (the last one to the first).
+    peer_listen = f":{PORT_PEER}"        # where the server inside each sandbox listens (setups without a network narrow it)
+
+    def wants_peer(self, n: int) -> bool:
+        return "peer" in self.scenarios and n >= 2
+
+    def peer_of(self, idx: int, n: int | None = None) -> int:
+        return idx % (n or len(self.sandboxes)) + 1
+
+    def _create_sandboxes(self, n: int, target_ip=None, peer_ip=None):
+        # Every setup resolves names, so name handling is exercised everywhere.
+        # target_ip(i): the address `target.bench` has inside sandbox i (default: the real target).
+        # peer_ip(i):   the address `peer.bench` has inside sandbox i (only when the peer scenario is on).
+        self._peer = self.wants_peer(n)
+        self.sandboxes = []
+        for i in range(1, n + 1):
+            hosts = {TARGET_NAME: target_ip(i) if target_ip else TARGET_IP}
+            if self._peer and peer_ip:
+                hosts[PEER_NAME] = peer_ip(i)
+            self.sandboxes.append(self.rt.create(i, net="routed", hosts=hosts, cpus=self.cfg.cores["sandbox"]))
+
+    def start_peer_servers(self):
+        """The service the peer scenario talks to: one netbench server inside every sandbox."""
+        for sb in self.sandboxes:
+            self.rt.start_in(sb, [self.rt.binary, "server", "--listen", self.peer_listen, "--procs", "1"], self.cfg.cores["sandbox"])
+
+    def wait_peer_ready(self):
+        self._wait_path_ready("The peer path (sandbox to sandbox) did not come up.", target=lambda sb: self.target_for(sb, "peer"))
 
     @abstractmethod
     def up(self, n: int) -> list[Sandbox]: ...
 
-    def _wait_path_ready(self, hint: str, timeout: float = 40.0):
+    def _wait_path_ready(self, hint: str, timeout: float = 40.0, target=None):
         """Return once every sandbox reaches the target through its whole mediation path (the first real probe)."""
         def ready(sb):
             deadline = time.time() + timeout
             while time.time() < deadline:
                 # --expect ok matters: without it `probe` exits 0 even when the path is down and the wait would never wait
-                argv = self.rt.exec_argv(sb, [self.rt.binary, "probe", "--target", self.target_for(sb), "--expect", "ok", "--timeout", "1s"], self.cfg.cores["sandbox"])
+                argv = self.rt.exec_argv(sb, [self.rt.binary, "probe", "--target", target(sb) if target else self.target_for(sb), "--expect", "ok", "--timeout", "1s"], self.cfg.cores["sandbox"])
                 if run(argv, check=False, timeout=30).returncode == 0:
                     return True
                 time.sleep(0.3)
@@ -73,10 +98,21 @@ class Setup(ABC):
         if bad:
             raise RuntimeError(f"the path to the target did not come up in {len(bad)} sandbox(es), e.g. {bad[0]}. {hint}")
 
-    def target_for(self, sb: Sandbox) -> str:
-        return f"{TARGET_NAME}:{PORT_ALLOWED}"
+    def target_for(self, sb: Sandbox, scenario: str = "outbound") -> str:
+        return f"{PEER_NAME}:{PORT_PEER}" if scenario == "peer" else f"{TARGET_NAME}:{PORT_ALLOWED}"
 
-    def probes(self, sb: Sandbox) -> list[Probe]:
+    def probes(self, sb: Sandbox, scenario: str = "outbound") -> list[Probe]:
+        return self._peer_probes(sb) if scenario == "peer" else self.outbound_probes(sb)
+
+    def _peer_probes(self, sb: Sandbox) -> list[Probe]:
+        ps = [Probe("allowed-peer", self.target_for(sb, "peer"), "ok")]
+        n = len(self.sandboxes)
+        third = self.peer_of(self.peer_of(sb.idx, n), n)
+        if n >= 3:                                              # a sandbox that is NOT this one's peer must be unreachable
+            ps.append(Probe("third-sandbox", f"{sandbox_net(third)[0]}:{PORT_PEER}", "blocked"))
+        return ps
+
+    def outbound_probes(self, sb: Sandbox) -> list[Probe]:
         ps = [Probe("allowed", self.target_for(sb), "ok")]
         if self.enforces:
             ps += [Probe("forbidden-port", f"{TARGET_NAME}:{PORT_FORBIDDEN}", "blocked"),
@@ -97,7 +133,7 @@ class Control(Setup):
     id, slug, enforces = "0", "setup0-control", False
 
     def up(self, n):
-        self._create_sandboxes(n)
+        self._create_sandboxes(n, peer_ip=lambda i: sandbox_net(self.peer_of(i, n))[0])
         return self.sandboxes
 
 
@@ -113,6 +149,10 @@ class Kernel(Setup):
         fwd = ["type filter hook forward priority -1; policy accept;", "ct state established,related accept"]
         for sb in self.sandboxes:
             fwd.append(f'iifname "{sb.host_if}" ip saddr {sb.ip} ip daddr {TARGET_IP} tcp dport {PORT_ALLOWED} accept')
+        if self._peer:                                          # each sandbox may reach its ring neighbour's server, nothing else
+            for sb in self.sandboxes:
+                nxt = self.sandboxes[self.peer_of(sb.idx) - 1]
+                fwd.append(f'iifname "{sb.host_if}" ip saddr {sb.ip} ip daddr {nxt.ip} tcp dport {PORT_PEER} accept')
         fwd.append('iifname "bsb*" drop')
         inp = ["type filter hook input priority -1; policy accept;", 'iifname "bsb*" drop']
         body = "\n".join(["table inet bench {", " chain forward {", *["  " + l for l in fwd], " }",
@@ -120,7 +160,7 @@ class Kernel(Setup):
         return body + "\n"
 
     def up(self, n):
-        self._create_sandboxes(n)
+        self._create_sandboxes(n, peer_ip=lambda i: sandbox_net(self.peer_of(i, n))[0])
         run(["nft", "delete", "table", "inet", "bench"], check=False)
         run(["nft", "-f", "-"], input=self.ruleset())
         return self.sandboxes
@@ -144,7 +184,8 @@ class ProxyNet(Setup):
         self.envoy = EnvoyProxy(cfg, self.workdir, "net")
 
     def ruleset(self) -> str:
-        elements = ", ".join(f'"{sb.host_if}" . {sb.gw} . {PORT_ALLOWED}' for sb in self.sandboxes)
+        ports = [PORT_ALLOWED] + ([PORT_PEER] if self._peer else [])
+        elements = ", ".join(f'"{sb.host_if}" . {sb.gw} . {p}' for sb in self.sandboxes for p in ports)
         return f"""table inet bench {{
   set listeners {{
     type ifname . ipv4_addr . inet_service
@@ -164,14 +205,21 @@ class ProxyNet(Setup):
 """
 
     def up(self, n):
-        self._create_sandboxes(n, target_ip=lambda i: sandbox_net(i)[1])
+        self._create_sandboxes(n, target_ip=lambda i: sandbox_net(i)[1], peer_ip=lambda i: sandbox_net(i)[1])
         run(["nft", "delete", "table", "inet", "bench"], check=False)
         run(["nft", "-f", "-"], input=self.ruleset())
         self.envoy = EnvoyProxy(self.cfg, self.workdir, "net")
-        self.envoy.start([tcp_listener(f"sb{sb.idx}", sb.gw, PORT_ALLOWED) for sb in self.sandboxes])
+        listeners = [tcp_listener(f"sb{sb.idx}", sb.gw, PORT_ALLOWED) for sb in self.sandboxes]
+        clusters = []
+        if self._peer:                                          # one listener per sandbox on its own gateway, one cluster per ring edge
+            for sb in self.sandboxes:
+                nxt = self.sandboxes[self.peer_of(sb.idx) - 1]
+                listeners.append(tcp_listener(f"peer{sb.idx}", sb.gw, PORT_PEER, cluster=f"peer{sb.idx}"))
+                clusters.append((f"peer{sb.idx}", {"socket_address": {"address": nxt.ip, "port_value": PORT_PEER}}))
+        self.envoy.start(listeners, clusters)
         return self.sandboxes
 
-    def probes(self, sb):
+    def outbound_probes(self, sb):
         ps = [Probe("allowed", self.target_for(sb), "ok"),
               Probe("direct-to-target", f"{TARGET_IP}:{PORT_ALLOWED}", "blocked"),
               Probe("host-input", f"{sb.gw}:{PORT_HOST}", "blocked")]
@@ -207,22 +255,40 @@ class ProxyUds(Setup):
         shutil.rmtree(RUN_DIR, ignore_errors=True)
         for i in range(1, n + 1):
             self._dir(i).mkdir(parents=True, mode=0o755)
-        self.sandboxes = [self.rt.create(i, net="none", hosts={TARGET_NAME: "127.0.0.1"}, cpus=self.cfg.cores["sandbox"],
-                                         mounts={str(self._dir(i)): "/sock"}) for i in range(1, n + 1)]
+        self._peer = self.wants_peer(n)
+        self.sandboxes = []
+        for i in range(1, n + 1):
+            hosts = {TARGET_NAME: "127.0.0.1"}
+            if self._peer:
+                hosts[PEER_NAME] = "127.0.0.2"                  # the sandbox's own relay for peer traffic listens here
+            self.sandboxes.append(self.rt.create(i, net="none", hosts=hosts, cpus=self.cfg.cores["sandbox"], mounts={str(self._dir(i)): "/sock"}))
         self.envoy = EnvoyProxy(self.cfg, self.workdir, "uds")
-        self.envoy.start([pipe_listener(f"sb{sb.idx}", str(self._dir(sb.idx) / "proxy.sock")) for sb in self.sandboxes])
+        listeners = [pipe_listener(f"sb{sb.idx}", str(self._dir(sb.idx) / "proxy.sock")) for sb in self.sandboxes]
+        clusters = []
+        if self._peer:                                          # Envoy reaches a sandbox through that sandbox's own in.sock
+            for sb in self.sandboxes:
+                nxt = self.sandboxes[self.peer_of(sb.idx) - 1]
+                listeners.append(pipe_listener(f"peer{sb.idx}", str(self._dir(sb.idx) / "peer.sock"), cluster=f"peer{sb.idx}"))
+                clusters.append((f"peer{sb.idx}", {"pipe": {"path": str(self._dir(nxt.idx) / "in.sock")}}))
+        self.envoy.start(listeners, clusters)
         for sb in self.sandboxes:
-            sock = sb.inside(str(self._dir(sb.idx) / "proxy.sock"))
-            stats = sb.inside(str(self._dir(sb.idx) / "relay.stats"))
-            self.rt.start_in(sb, [self.rt.binary, "relay", "--listen", f"127.0.0.1:{PORT_ALLOWED}", "--unix", sock, "--stats", stats],
-                             self.cfg.cores["sandbox"])
+            d = self._dir(sb.idx)
+            relay = [self.rt.binary, "relay"]
+            cpus = self.cfg.cores["sandbox"]
+            self.rt.start_in(sb, [*relay, "--listen", f"127.0.0.1:{PORT_ALLOWED}", "--to", f"unix:{sb.inside(str(d / 'proxy.sock'))}",
+                                  "--stats", sb.inside(str(d / "relay.stats"))], cpus)
+            if self._peer:
+                self.rt.start_in(sb, [*relay, "--listen", f"127.0.0.2:{PORT_PEER}", "--to", f"unix:{sb.inside(str(d / 'peer.sock'))}"], cpus)
+                self.rt.start_in(sb, [*relay, "--listen", f"unix:{sb.inside(str(d / 'in.sock'))}", "--to", f"127.0.0.1:{PORT_PEER}"], cpus)
         self._wait_relays()
         return self.sandboxes
+
+    peer_listen = f"127.0.0.1:{PORT_PEER}"
 
     def _wait_relays(self):
         self._wait_path_ready("Under gVisor the runtime must allow host Unix sockets (runsc --host-uds=open, README.md).")
 
-    def probes(self, sb):
+    def outbound_probes(self, sb):
         gw = sandbox_net(sb.idx)[1]
         return [Probe("allowed", self.target_for(sb), "ok"),
                 Probe("direct-to-target", f"{TARGET_IP}:{PORT_ALLOWED}", "blocked"),
@@ -287,6 +353,7 @@ class RouterSetup(Setup):
         if not self.cfg.router or not self.cfg.sidecar:
             raise RuntimeError("setup 4 needs `router` and `sidecar` in the config (see README.md)")
         sidecar = Path(self.cfg.sidecar).resolve()
+        self._peer = self.wants_peer(n)
         shutil.rmtree(RUN_DIR, ignore_errors=True)
         for i in range(1, n + 1):
             self._dir(i).mkdir(parents=True, mode=0o755)
@@ -295,19 +362,24 @@ class RouterSetup(Setup):
                                          mounts={str(self._dir(i)): "/sock", str(sidecar.parent): "/sidecar"}) for i in range(1, n + 1)]
         for sb in self.sandboxes:                              # peers first: this makes the router create each socket
             sock = self._dir(sb.idx) / "router.sock"
-            peer = stable_id("peer", sb.name)
-            self.api.create_peer(peer, f"sb{sb.idx}", str(sock))
+            self.api.create_peer(stable_id("peer", sb.name), f"sb{sb.idx}", str(sock))
             for _ in range(50):
                 if sock.exists():
                     break
                 time.sleep(0.1)
             else:
                 raise RuntimeError(f"the router did not create {sock} after the peer was added")
+        for sb in self.sandboxes:                              # then the routes (a peer route needs its destination peer to exist)
+            peer = stable_id("peer", sb.name)
             self.api.create_route(stable_id("route", sb.name), peer, TARGET_NAME, PORT_ALLOWED, TARGET_IP, PORT_ALLOWED)
+            if self._peer:                                     # peer.bench: the router asks the NEXT sandbox's sidecar to connect to its own server
+                nxt = self.sandboxes[self.peer_of(sb.idx) - 1]
+                self.api.create_route(stable_id("route-peer", sb.name), peer, PEER_NAME, PORT_PEER, "127.0.0.1", PORT_PEER,
+                                      destination_peer_id=stable_id("peer", nxt.name))
         for sb in self.sandboxes:                              # then the sidecars
             env = [f"Sidecar__SocketPath={sb.inside(str(self._dir(sb.idx) / 'router.sock'))}",
                    f"Sidecar__StatsPath={sb.inside(str(self._dir(sb.idx) / 'sidecar.stats'))}",
-                   "Logging__LogLevel__Default=Warning", 
+                   "Logging__LogLevel__Default=Warning",
                    "DOTNET_TieredPGO=0",
                    "DOTNET_BUNDLE_EXTRACT_BASE_DIR=/tmp",
                    "DOTNET_ThreadPool_UnfairSemaphoreSpinLimit=0",
@@ -316,7 +388,9 @@ class RouterSetup(Setup):
         self._wait_path_ready("Check <group>/mediator/router.log, and that the sidecar binary is self-contained and runs in the sandbox image (see README.md).")
         return self.sandboxes
 
-    def probes(self, sb):
+    peer_listen = f"127.0.0.1:{PORT_PEER}"
+
+    def outbound_probes(self, sb):
         gw = sandbox_net(sb.idx)[1]
         return [Probe("allowed", self.target_for(sb), "ok"),
                 Probe("unlisted-port", f"{TARGET_NAME}:{PORT_FORBIDDEN}", "blocked"),      # the sidecar listens only on routed ports
@@ -347,6 +421,9 @@ class RouterSetup(Setup):
 def kill_leftovers(cfg=None):
     """Envoy processes and socket directories left behind by a crashed run."""
     run(["pkill", "-f", "envoy-(net|uds)\\.yaml"], check=False)
+    run(["pkill", "-f", r"(^|/)netbench (server|relay) "], check=False)      # target, peer and helper servers and relays: they hold ports
+    if cfg is not None and cfg.sidecar:
+        run(["pkill", "-f", re.escape(cfg.sidecar)], check=False)
     if cfg is not None and cfg.router:                           # the router is a user-defined command: match it whole
         run(["pkill", "-f", re.escape(cfg.router)], check=False)
     shutil.rmtree(RUN_DIR, ignore_errors=True)

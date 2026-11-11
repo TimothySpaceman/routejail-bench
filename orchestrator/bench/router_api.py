@@ -25,9 +25,10 @@ def peer_payload(peer_id: str, name: str, socket_path: str) -> dict:
     return {"id": peer_id, "name": name, "socketPath": socket_path, "enabled": True}
 
 
-def route_payload(route_id: str, peer_id: str, name: str, port: int, host: str, target_port: int) -> dict:
+def route_payload(route_id: str, peer_id: str, name: str, port: int, host: str, target_port: int, destination_peer_id: str | None = None) -> dict:
+    """With destination_peer_id the router asks THAT peer's sidecar to connect to host:target_port inside its own sandbox."""
     return {"id": route_id, "sourcePeerId": peer_id, "name": name, "port": port, "host": host,
-            "targetPort": target_port, "destinationPeerId": None, "protocol": "tcp"}
+            "targetPort": target_port, "destinationPeerId": destination_peer_id, "protocol": "tcp"}
 
 
 class RouterApi:
@@ -61,8 +62,8 @@ class RouterApi:
     def create_peer(self, peer_id, name, socket_path):
         return self._call("POST", "/peers", peer_payload(peer_id, name, socket_path))
 
-    def create_route(self, route_id, peer_id, name, port, host, target_port):
-        return self._call("POST", "/routes", route_payload(route_id, peer_id, name, port, host, target_port))
+    def create_route(self, route_id, peer_id, name, port, host, target_port, destination_peer_id=None):
+        return self._call("POST", "/routes", route_payload(route_id, peer_id, name, port, host, target_port, destination_peer_id))
 
     def peers(self):
         return self._call("GET", "/peers")

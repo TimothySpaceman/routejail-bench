@@ -101,6 +101,31 @@ def tuning_findings(cfg: Config) -> list[Finding]:
     return out
 
 
+def uds_create_selftest(cfg: Config) -> tuple[bool, str]:
+    """Can a sandbox CREATE a Unix socket in a mounted host directory that the host can then connect to?
+    Needed by setup 3's peer scenario (the host reaches a sandbox through a socket the sandbox creates)."""
+    d, name = Path("/tmp/bench-check2"), "bench-check-uds"
+    shutil.rmtree(d, ignore_errors=True)
+    d.mkdir(parents=True)
+    run(["docker", "rm", "-f", name], check=False)
+    try:
+        cmd = ["docker", "run", "-d", "--rm", "--name", name, "--network", "none"] + (["--runtime", cfg.docker_runtime] if cfg.docker_runtime else []) + \
+              ["--cpuset-cpus", cfg.cores["sandbox"], "-v", f"{cfg.netbench}:/netbench:ro", "-v", f"{d}:/sock", cfg.docker_image,
+               "/netbench", "server", "--listen", "unix:/sock/p.sock"]
+        cp = run(cmd, check=False, timeout=120)
+        if cp.returncode != 0:
+            return False, (cp.stderr.strip().splitlines() or ["could not start the container"])[-1][:150]
+        for _ in range(50):
+            if (d / "p.sock").exists():
+                break
+            time.sleep(0.1)
+        pr = run([str(cfg.netbench), "probe", "--target", f"unix:{d}/p.sock", "--expect", "ok", "--timeout", "3s"], check=False)
+        return (pr.returncode == 0, "" if pr.returncode == 0 else "the host cannot connect to a socket created inside the sandbox")
+    finally:
+        run(["docker", "rm", "-f", name], check=False)
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def envoy_version(cfg: Config) -> str | None:
     """Version string of the configured Envoy, or None if it cannot be started."""
     cp = run([cfg.envoy, "--version"], check=False, timeout=30)

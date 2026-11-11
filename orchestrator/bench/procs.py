@@ -38,19 +38,29 @@ def read_pid(pid: int):
 
 
 def read_stats_file(path: Path, t_from: float, t_to: float) -> list[dict]:
-    out = []
+    """Samples from a self-reported stats file: any sequence of JSON objects, one per line or spread over several lines.
+    A half-written last object (the process is still running) is skipped."""
     try:
-        lines = Path(path).read_text().splitlines()
+        text = Path(path).read_text()
     except OSError:
-        return out
-    for line in lines:
-        try:
-            d = json.loads(line)
-        except ValueError:
+        return []
+    dec, pos, out = json.JSONDecoder(), 0, []
+    while pos < len(text):
+        if text[pos].isspace():
+            pos += 1
             continue
-        if t_from <= d.get("t", 0) <= t_to:
-            out.append({"t": d["t"], "cpu_s": d.get("cpu_ns", 0) / 1e9, "rss_kb": d.get("rss_kb", 0),
-                        "hwm_kb": d.get("hwm_kb", 0), "conns": d.get("conns", 0)})
+        try:
+            d, pos = dec.raw_decode(text, pos)
+        except ValueError:                                   # junk or a partial write: resynchronise at the next line
+            nl = text.find("\n", pos)
+            pos = len(text) if nl < 0 else nl + 1
+            continue
+        if isinstance(d, dict) and t_from <= d.get("t", 0) <= t_to:
+            sample = {"t": d["t"], "cpu_s": d.get("cpu_ns", 0) / 1e9, "rss_kb": d.get("rss_kb", 0),
+                      "hwm_kb": d.get("hwm_kb", 0), "conns": d.get("conns", 0)}
+            if d.get("pss_kb"):                              # proportional set size: shared pages split between processes
+                sample["pss_kb"] = d["pss_kb"]
+            out.append(sample)
     return out
 
 
