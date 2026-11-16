@@ -173,7 +173,7 @@ def test_sampler_collects_host_and_self_reported_processes(tmp_path):
     host = data["groups"]["host"]["instances"][0]["samples"]
     assert len(host) >= 3 and host[-1]["cpu_s"] > host[0]["cpu_s"]
     relay = data["groups"]["relay"]["instances"][0]
-    assert relay["id"] == "sb1" and relay["samples"][0]["rss_kb"] == 3000
+    assert relay["id"] == "sb1/relay" and relay["samples"][0]["rss_kb"] == 3000
 
 
 def test_readiness_wait_really_waits_for_a_successful_probe(tmp_path, monkeypatch):
@@ -442,3 +442,41 @@ def test_plan_counts_the_peer_scenario_only_from_two_sandboxes(tmp_path):
     by_n = {g["n"]: g["runs"] for g in p["groups"]}
     assert by_n[1] == 6 and by_n[5] == 12                                   # 2 benchmarks x 3 runs; peer doubles it only for N=5
     assert p["total_runs"] == base + 6
+
+
+def test_stats_file_may_be_pretty_printed_over_several_lines_and_carries_pss(tmp_path):
+    """The real sidecar writes each sample as a multi-line JSON object (and a pss_kb field): it must not look empty."""
+    f = tmp_path / "sidecar.stats"
+    f.write_text('{\n"t": 10.5,\n"cpu_ns":2000000000,\n"rss_kb":98000,\n"hwm_kb":99000,\n"conns":3,"pss_kb":61000\n}\n'
+                 '{\n"t": 11.5,\n"cpu_ns":2100000000,\n"rss_kb":98100,\n"hwm_kb":99000,\n"conns":4\n}\n')
+    out = procs.read_stats_file(f, 0, 99)
+    assert [s["t"] for s in out] == [10.5, 11.5] and out[0]["cpu_s"] == pytest.approx(2.0)
+    assert out[0]["pss_kb"] == 61000 and "pss_kb" not in out[1]                      # only when the process reports it
+
+
+def test_stats_file_skips_a_half_written_last_object_and_junk(tmp_path):
+    f = tmp_path / "relay.stats"
+    f.write_text('garbage line\n{"t": 5.0, "cpu_ns": 1, "rss_kb": 2}\n{"t": 6.0, "cpu_')
+    assert [s["t"] for s in procs.read_stats_file(f, 0, 99)] == [5.0]
+
+
+def test_every_relay_of_setup3_reports_itself_so_peer_traffic_is_not_invisible(tmp_path):
+    """Regression: only the outbound relay had a stats file, so during peer traffic the relay's CPU read as ~0."""
+    s = _ring(setups.ProxyUds(_cfg(tmp_path), FakeRuntime()), 2)
+    files = [f.name for f in s.processes()[1].files]
+    assert files.count("relay-out.stats") == 2 and files.count("relay-peer-out.stats") == 2 and files.count("relay-peer-in.stats") == 2
+    s._peer = False
+    assert {f.name for f in s.processes()[1].files} == {"relay-out.stats"}               # without the peer scenario only the outbound relay exists
+    assert len({f"{f.parent.name}/{f.stem}" for f in _ring(setups.ProxyUds(_cfg(tmp_path), FakeRuntime()), 2).processes()[1].files}) == 6    # instance ids are unique
+
+
+def test_readiness_timeout_grows_with_sandboxes_and_is_longest_under_gvisor(tmp_path):
+    def timeout(runtime, docker_runtime, n):
+        c = _cfg(tmp_path)
+        c.runtime, c.docker_runtime = runtime, docker_runtime
+        s = setups.ProxyUds(c, FakeRuntime())
+        s.sandboxes = [Sandbox(i, f"bench-sb{i}", "none") for i in range(1, n + 1)]
+        return s.ready_timeout()
+    assert timeout("netns", "", 5) < timeout("docker", "", 50) < timeout("docker", "runsc", 50)
+    assert timeout("docker", "runsc", 50) >= 150                              # 50 .NET sidecars on 2 cores under gVisor need minutes, not 40 s
+    assert timeout("docker", "", 5) >= 40

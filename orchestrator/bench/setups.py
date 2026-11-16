@@ -81,8 +81,16 @@ class Setup(ABC):
     @abstractmethod
     def up(self, n: int) -> list[Sandbox]: ...
 
-    def _wait_path_ready(self, hint: str, timeout: float = 40.0, target=None):
+    def ready_timeout(self) -> float:
+        """How long to wait for the whole path to come up: starting N processes (sidecars, relays) takes longer the more
+        sandboxes there are, and much longer under gVisor on few cores."""
+        rk = "runsc" if self.cfg.runtime == "docker" and self.cfg.docker_runtime == "runsc" else self.cfg.runtime
+        return 40.0 + max(len(self.sandboxes), 1) * {"netns": 0.3, "docker": 0.8, "runsc": 3.0}.get(rk, 1.0)
+
+    def _wait_path_ready(self, hint: str, timeout: float | None = None, target=None):
         """Return once every sandbox reaches the target through its whole mediation path (the first real probe)."""
+        timeout = timeout or self.ready_timeout()
+
         def ready(sb):
             deadline = time.time() + timeout
             while time.time() < deadline:
@@ -275,11 +283,11 @@ class ProxyUds(Setup):
             d = self._dir(sb.idx)
             relay = [self.rt.binary, "relay"]
             cpus = self.cfg.cores["sandbox"]
-            self.rt.start_in(sb, [*relay, "--listen", f"127.0.0.1:{PORT_ALLOWED}", "--to", f"unix:{sb.inside(str(d / 'proxy.sock'))}",
-                                  "--stats", sb.inside(str(d / "relay.stats"))], cpus)
+            stats = lambda name: ["--stats", sb.inside(str(d / name))]      # every relay reports itself: each one carries different traffic
+            self.rt.start_in(sb, [*relay, "--listen", f"127.0.0.1:{PORT_ALLOWED}", "--to", f"unix:{sb.inside(str(d / 'proxy.sock'))}", *stats("relay-out.stats")], cpus)
             if self._peer:
-                self.rt.start_in(sb, [*relay, "--listen", f"127.0.0.2:{PORT_PEER}", "--to", f"unix:{sb.inside(str(d / 'peer.sock'))}"], cpus)
-                self.rt.start_in(sb, [*relay, "--listen", f"unix:{sb.inside(str(d / 'in.sock'))}", "--to", f"127.0.0.1:{PORT_PEER}"], cpus)
+                self.rt.start_in(sb, [*relay, "--listen", f"127.0.0.2:{PORT_PEER}", "--to", f"unix:{sb.inside(str(d / 'peer.sock'))}", *stats("relay-peer-out.stats")], cpus)
+                self.rt.start_in(sb, [*relay, "--listen", f"unix:{sb.inside(str(d / 'in.sock'))}", "--to", f"127.0.0.1:{PORT_PEER}", *stats("relay-peer-in.stats")], cpus)
         self._wait_relays()
         return self.sandboxes
 
@@ -296,7 +304,11 @@ class ProxyUds(Setup):
 
     def processes(self):
         return [ProcSpec("envoy", pids=[self.envoy.pid]),
-                ProcSpec("relay", files=[self._dir(sb.idx) / "relay.stats" for sb in self.sandboxes])]
+                ProcSpec("relay", files=[self._dir(sb.idx) / name for sb in self.sandboxes for name in self.relay_stats()])]
+
+    def relay_stats(self) -> list[str]:
+        """Stats files of the relays that exist: the outbound relay always, the two peer relays when the peer scenario is on."""
+        return ["relay-out.stats"] + (["relay-peer-out.stats", "relay-peer-in.stats"] if self._peer else [])
 
     def down(self):
         self.envoy.stop()

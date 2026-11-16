@@ -150,3 +150,27 @@ def test_peer_scenario_can_be_added_later_to_a_finished_outbound_experiment(make
     r, rt, _ = harness(bigger)
     r.run_all()
     assert (cfg_dir := bigger.results_dir / "t" / "setup9-fake" / "peer" / "ttfb" / "n3" / "done.json").exists(), cfg_dir
+
+
+def test_peer_path_that_cannot_come_up_does_not_cost_the_outbound_results(make_cfg, harness):
+    """Regression (gVisor, setup 3): a failing peer path aborted the whole group, so the outbound scenario was lost too."""
+    from conftest import FakeSetup
+    cfg = make_cfg(ns=(3,), scenarios=("outbound", "peer"))
+    FakeSetup.peer_fails = True
+    r, rt, topo = harness(cfg)
+    FakeSetup.peer_fails = True                                              # the harness resets it; set it again for this run
+    r.run_all()
+    base = cfg.results_dir / "t" / "setup9-fake"
+    assert (base / "outbound" / "ttfb" / "n3" / "done.json").exists()          # outbound was measured
+    assert not (base / "peer" / "ttfb" / "n3" / "done.json").exists()
+    flag = json.loads((base / "peer" / "n3" / "failed.json").read_text())
+    assert flag["unavailable"] is True and "peer" in flag["error"]
+    # resuming: the unavailable scenario is remembered, the finished group is not repeated
+    r2, rt2, topo2 = harness(cfg)
+    r2.run_all()
+    assert topo2.events == [] and rt2.calls == []
+    (base / "peer" / "n3" / "failed.json").unlink()                           # deleting the flag asks for another try
+    FakeSetup.peer_fails = False
+    r3, rt3, _ = harness(cfg)
+    r3.run_all()
+    assert (base / "peer" / "ttfb" / "n3" / "done.json").exists()

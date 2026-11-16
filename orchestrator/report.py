@@ -2,15 +2,18 @@
 """Short, shareable summary of one experiment folder: what failed and why, without the raw JSON files.
 
     python3 report.py results/<experiment>  >  report.txt
+    python3 report.py results/<experiment> --untuned-cells        # only the cell folders measured while the host was untuned
 
 No root needed, standard library only, independent of the rest of the code (works with older versions too).
 It prints: host and tuning facts, failed groups (with the mediator's last log lines), failed probes, runs that were
 invalid or redone (grouped, with the distinct reasons and error counts), and the warnings and tail of orchestrator.log.
 """
+import bisect
 import collections
 import json
 import re
 import sys
+import time
 from pathlib import Path
 
 
@@ -51,7 +54,63 @@ def header(exp, out):
         out.append("(no manifest.json: was this the experiment folder?)")
 
 
+def untuned_reasons(h):
+    """Why the host was not in the benchmark state when a session started (empty list = tuned)."""
+    r = []
+    if str(h.get("smt_active")) not in ("0", "None"):
+        r.append("SMT on")
+    if any(g != "performance" for g in (h.get("governors") or [])):
+        r.append("governor not performance")
+    if any(v.get("min_khz") != v.get("max_khz") for v in (h.get("freq") or {}).values()):
+        r.append("clock not pinned")
+    if any(re.search(r"C[2-9]\w*=on", s) for s in set((h.get("cpuidle") or {}).values())):
+        r.append("deep idle states on")
+    return r
+
+
+def sessions_section(exp, launches):
+    """One line per session (a start of the orchestrator on this experiment), flagging untuned ones and listing their cells."""
+    mans = []
+    for p in sorted(exp.glob("manifest*.json")):
+        m = load(p)
+        if m and m.get("started_unix"):
+            mans.append((m["started_unix"], p.name, m))
+    mans.sort(key=lambda x: x[0])
+    if not mans:
+        return []
+    starts = [m[0] for m in mans]
+    per = collections.defaultdict(collections.Counter)
+    for launched, key in launches:
+        i = bisect.bisect_right(starts, launched) - 1
+        if i >= 0:
+            per[i][key] += 1
+    lines = ["", "SESSIONS (each start of the orchestrator on this experiment)"]
+    for i, (started, name, m) in enumerate(mans):
+        bad = untuned_reasons(m.get("host", {}))
+        lines.append(f"  {i + 1}. {time.strftime('%m-%d %H:%M', time.localtime(started))}  {name[:34]:34} {'UNTUNED: ' + ', '.join(bad) if bad else 'tuned'}  ({sum(per[i].values())} runs)")
+        if bad:
+            for (setup, scenario, bench, n), c in sorted(per[i].items())[:10]:
+                lines.append(f"       {setup} {scenario} {bench} n={n}: {c} run(s)")
+            if len(per[i]) > 10:
+                lines.append(f"       (+{len(per[i]) - 10} more cells)")
+    return lines
+
+
+def untuned_cells(exp, launches):
+    """Cell folders with at least one run launched in a session that started on an untuned host."""
+    mans = sorted((m["started_unix"], untuned_reasons(m.get("host", {}))) for m in (load(p) for p in exp.glob("manifest*.json")) if m and m.get("started_unix"))
+    starts = [m[0] for m in mans]
+    cells = set()
+    for launched, key in launches:
+        i = bisect.bisect_right(starts, launched) - 1
+        if i >= 0 and mans[i][1]:
+            cells.add(key)
+    return sorted(exp / s / sc / b / f"n{n}" for s, sc, b, n in cells)
+
+
 def main(argv):
+    only_untuned = "--untuned-cells" in argv
+    argv = [a for a in argv if a != "--untuned-cells"]
     if len(argv) != 2:
         sys.exit(__doc__)
     exp = Path(argv[1])
@@ -64,6 +123,7 @@ def main(argv):
     cells = collections.defaultdict(lambda: {"final": 0, "accepted": 0, "rejected": 0, "reasons": collections.Counter(), "examples": {},
                                               "errors": collections.Counter(), "rc": collections.Counter(), "clientlog": collections.Counter()})
     failed, probes_bad, total_cells, done_cells = [], [], 0, 0
+    launches, hdr_len = [], len(out)
 
     for sdir in setups:
         for scdir in sorted(p for p in sdir.iterdir() if p.is_dir()):
@@ -94,6 +154,8 @@ def main(argv):
                     for rdir in sorted(p for p in ndir.iterdir() if p.is_dir() and p.name.startswith("run") and not p.name.endswith(".tmp")):
                         rejected = ".rejected" in rdir.name
                         meta = load(rdir / "run.json") or {}
+                        if meta.get("launched_unix"):
+                            launches.append((meta["launched_unix"], key))
                         cell["rejected" if rejected else "final"] += 1
                         if not rejected and meta.get("accepted"):
                             cell["accepted"] += 1
@@ -115,6 +177,10 @@ def main(argv):
                                 if "rc=" in line and "rc=0" not in line:
                                     cell["clientlog"][norm(re.sub(r"^\[[^\]]*\]\s*", "", line))[:200]] += 1
 
+    if only_untuned:
+        print("\n".join(str(p) for p in untuned_cells(exp, launches)))
+        return
+    out[hdr_len:hdr_len] = sessions_section(exp, launches)
     bad = {k: v for k, v in cells.items() if v["rejected"] or v["accepted"] < v["final"]}
     out += ["", f"CELLS: {total_cells} total, {done_cells} finished, {len(bad)} with invalid or redone runs, {len(failed)} failed group(s)"]
 

@@ -112,7 +112,8 @@ def main():
     ap.add_argument("command", choices=["check", "plan", "smoke", "run", "cleanup"])
     ap.add_argument("-c", "--config", required=True)
     ap.add_argument("-v", "--verbose", action="store_true")
-    ap.add_argument("--force", action="store_true", help="run despite failed tuning checks, or continue an experiment whose setup changed")
+    ap.add_argument("--force", action="store_true", help="continue an experiment whose settings changed, or run with a setup prerequisite missing")
+    ap.add_argument("--allow-untuned", action="store_true", help="run even though the host is not in the benchmark state (results will be unreliable)")
     args = ap.parse_args()
     cfg = cfgmod.load(args.config)
 
@@ -146,8 +147,8 @@ def main():
         log.warning("%s: %s  (%s)", f.level, f.what, f.fix)
     if any(f.level == "FAIL" for f in prereq) and not args.force:
         sys.exit("Not starting: a configured setup is missing something (see above). Fix it, remove that setup from `setups`, or pass --force.")
-    if args.command == "run" and any(f.level == "FAIL" for f in tuning) and not args.force:
-        sys.exit("Refusing to start the full run: the host is not in the benchmark state (see above). Fix it, or pass --force.")
+    if args.command == "run" and any(f.level == "FAIL" for f in tuning) and not args.allow_untuned:
+        sys.exit("Refusing to start the full run: the host is not in the benchmark state (see above). Run `sudo ./host-tune.sh --verify`, or pass --allow-untuned (results will be unreliable).")
     try:
         Runner(cfg).run_all(force=args.force)
     except KeyboardInterrupt:

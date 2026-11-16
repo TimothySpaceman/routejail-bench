@@ -68,6 +68,11 @@ class FakeTopology:
 class FakeSetup(setups_mod.Setup):
     id, slug, enforces = "9", "setup9-fake", False
     current_n = [0]
+    peer_fails = False                       # simulate a runtime where the peer path cannot come up
+
+    def wait_peer_ready(self):
+        if FakeSetup.peer_fails:
+            raise RuntimeError("the path to the target did not come up in 3 sandbox(es). The peer path (sandbox to sandbox) did not come up.")
 
     def up(self, n):
         FakeSetup.current_n[0] = n
@@ -121,6 +126,7 @@ def harness(monkeypatch):
     monkeypatch.setattr(runner_mod.os, "sched_setaffinity", lambda *a, **k: None, raising=False)   # missing on macOS
     monkeypatch.setattr(runner_mod, "kill_leftovers", lambda *a, **k: None)
     FakeSetup.current_n[0] = 0
+    FakeSetup.peer_fails = False
 
     def build(cfg, behavior=ok_behavior):
         rt, topo = FakeRuntime(behavior), FakeTopology()

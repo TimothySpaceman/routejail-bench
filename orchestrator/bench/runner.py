@@ -107,8 +107,16 @@ class Runner:
         from .setups import SETUPS
         return self.out / SETUPS[setup_id].slug / scenario / bench.name / f"n{n}"
 
+    def _unavailable(self, setup_id: str, n: int, scenario: str) -> bool:
+        """A scenario whose path could not come up in this setup (recorded as failed.json with `unavailable`); delete that file to retry."""
+        try:
+            return bool(json.loads((self._group_dir(setup_id, n, scenario) / "failed.json").read_text()).get("unavailable"))
+        except (OSError, ValueError):
+            return False
+
     def _group_done(self, setup_id: str, n: int) -> bool:
-        return all((self._cell_dir(setup_id, n, b, sc) / "done.json").exists() for sc in scenarios_for(self.cfg, n) for b in self.cfg.benchmarks)
+        return all((self._cell_dir(setup_id, n, b, sc) / "done.json").exists()
+                   for sc in scenarios_for(self.cfg, n) if not self._unavailable(setup_id, n, sc) for b in self.cfg.benchmarks)
 
     # ---------- one group: N sandboxes of one setup, all benchmarks, all runs ----------
 
@@ -117,7 +125,10 @@ class Runner:
         self.rt.cleanup_all()
         kill_leftovers(self.cfg)
         setup = make_setup(setup_id, self.cfg, self.rt)
-        scenarios = scenarios_for(self.cfg, n)
+        scenarios = [s for s in scenarios_for(self.cfg, n) if not self._unavailable(setup_id, n, s)]
+        if not scenarios:
+            log.info("nothing to run for setup %s n=%d: its scenarios are unavailable (see failed.json)", setup_id, n)
+            return
         setup.scenarios = scenarios
         setup.workdir = self._group_dir(setup_id, n, scenarios[0]) / "mediator"
         self.topo.up()
@@ -126,8 +137,15 @@ class Runner:
             sandboxes = setup.up(n)
             self.topo.allow_replies()
             if setup.wants_peer(n):
-                setup.start_peer_servers()
-                setup.wait_peer_ready()
+                try:
+                    setup.start_peer_servers()
+                    setup.wait_peer_ready()
+                except RuntimeError as e:        # the peer path cannot work here: keep the other scenarios, remember it for resuming
+                    log.error("peer scenario unavailable for setup %s n=%d, continuing without it: %s", setup_id, n, str(e)[:300])
+                    pdir = self._group_dir(setup_id, n, "peer")
+                    pdir.mkdir(parents=True, exist_ok=True)
+                    (pdir / "failed.json").write_text(json.dumps({"error": f"peer scenario unavailable: {e}", "unavailable": True}) + "\n")
+                    scenarios = [s for s in scenarios if s != "peer"]
             for scenario in scenarios:
                 self._probe_group(setup, sandboxes, self._group_dir(setup_id, n, scenario), scenario)
                 for bench in self.cfg.benchmarks:
